@@ -285,7 +285,9 @@ class AlignedCTClipTrainer(nn.Module):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=36000))
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, kwargs], **accelerate_kwargs)
-
+        self.gradient_accumulation_steps = 4
+        self.accumulated_steps = 0
+        
         self.CTClip = CTClip
         if tokenizer != None:
             self.tokenizer = tokenizer
@@ -375,6 +377,51 @@ class AlignedCTClipTrainer(nn.Module):
     def is_main(self):
         return self.accelerator.is_main_process
 
+    # def train_step(self):
+    #     device = self.device
+    #     steps = int(self.steps.item())
+    #     self.CTClip.train()
+    #     logs = {}
+
+    #     pet_img, ct_img, text = next(self.dl_iter)
+    #     device = self.device
+    #     pet_img = pet_img.to(device)
+    #     ct_img = ct_img.to(device)
+    #     mask = torch.ones((pet_img.shape[0], pet_img.shape[2])).bool().to(device)
+    #     text = list(text)
+    #     text_tokens = self.tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=258).to(device)
+
+    #     with self.accelerator.autocast():
+    #         loss = self.CTClip(text_tokens, pet_img, ct_img, return_loss=True, device=device)
+
+    #     self.accelerator.backward(loss)
+    #     accum_log(logs, {'loss': loss.item()})
+    #     if exists(self.max_grad_norm):
+    #         self.accelerator.clip_grad_norm_(self.CTClip.parameters(), self.max_grad_norm)
+
+    #     self.optim.step()
+    #     self.optim.zero_grad()
+    #     # self.print(f"{steps}: loss: {logs['loss']}")
+    #     #  write logs to txt file 
+        
+    #     # with open(self.results_folder / '0_logs.txt', 'a') as f:
+    #     #     f.write(f"{steps}: loss: {logs['loss']}\n")
+
+    #     wandb.log({
+    #         'loss': logs['loss'],
+    #         'steps': steps,
+    #         'lr': self.optim.param_groups[0]['lr']
+    #     }, step=steps)
+
+    #     if self.is_main and not (steps % self.save_model_every):
+    #         model_path = str(self.results_folder / f'CTClip.{steps}.pt')
+    #         state_dict = self.accelerator.get_state_dict(self.CTClip, unwrap=False)
+    #         self.accelerator.save(state_dict, model_path)
+    #         self.print(f'{steps}: saving model to {str(self.results_folder)}')
+
+    #     self.steps += 1
+    #     return logs
+
     def train_step(self):
         device = self.device
         steps = int(self.steps.item())
@@ -382,7 +429,6 @@ class AlignedCTClipTrainer(nn.Module):
         logs = {}
 
         pet_img, ct_img, text = next(self.dl_iter)
-        device = self.device
         pet_img = pet_img.to(device)
         ct_img = ct_img.to(device)
         mask = torch.ones((pet_img.shape[0], pet_img.shape[2])).bool().to(device)
@@ -392,32 +438,32 @@ class AlignedCTClipTrainer(nn.Module):
         with self.accelerator.autocast():
             loss = self.CTClip(text_tokens, pet_img, ct_img, return_loss=True, device=device)
 
+        loss = loss / self.gradient_accumulation_steps  # normalize loss
         self.accelerator.backward(loss)
         accum_log(logs, {'loss': loss.item()})
+
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.CTClip.parameters(), self.max_grad_norm)
 
-        self.optim.step()
-        self.optim.zero_grad()
-        # self.print(f"{steps}: loss: {logs['loss']}")
-        #  write logs to txt file 
-        
-        # with open(self.results_folder / '0_logs.txt', 'a') as f:
-        #     f.write(f"{steps}: loss: {logs['loss']}\n")
+        self.accumulated_steps += 1
 
-        wandb.log({
-            'loss': logs['loss'],
-            'steps': steps,
-            'lr': self.optim.param_groups[0]['lr']
-        }, step=steps)
+        if self.accumulated_steps % self.gradient_accumulation_steps == 0:
+            self.optim.step()
+            self.optim.zero_grad()
+            self.steps += 1  
 
-        if self.is_main and not (steps % self.save_model_every):
-            model_path = str(self.results_folder / f'CTClip.{steps}.pt')
-            state_dict = self.accelerator.get_state_dict(self.CTClip, unwrap=False)
-            self.accelerator.save(state_dict, model_path)
-            self.print(f'{steps}: saving model to {str(self.results_folder)}')
+            wandb.log({
+                'loss': logs['loss'],
+                'steps': int(self.steps.item()),
+                'lr': self.optim.param_groups[0]['lr']
+            }, step=int(self.steps.item()))
 
-        self.steps += 1
+            if self.is_main and not (int(self.steps.item()) % self.save_model_every):
+                model_path = str(self.results_folder / f'CTClip.{int(self.steps.item())}.pt')
+                state_dict = self.accelerator.get_state_dict(self.CTClip, unwrap=False)
+                self.accelerator.save(state_dict, model_path)
+                self.print(f'{int(self.steps.item())}: saving model to {str(self.results_folder)}')
+
         return logs
 
     def train(self, log_fn=noop):
