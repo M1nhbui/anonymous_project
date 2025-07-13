@@ -44,4 +44,4 @@ checkpoints/
 *.pth
 
 results/
-infer/
+infer
