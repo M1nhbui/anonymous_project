@@ -1,3 +1,27 @@
+"""
+train.py
+
+This script is the main entry point for supervised fine-tuning of Vision-Language Models (VLMs) using the LLaVA framework.
+It supports multimodal data (images and text), LoRA adapters, quantization, and various model architectures (LLaMA, MPT, etc.).
+The script handles data loading, preprocessing, model setup, training, and checkpoint saving.
+It also integrates with Weights & Biases (wandb) for experiment tracking.
+
+Key components:
+- Argument classes for model, data, and training configuration.
+- Data preprocessing functions for different conversation styles and modalities.
+- Dataset and data collator for efficient batch loading.
+- Model loading and configuration, including LoRA and quantization.
+- Training loop using a custom trainer.
+- Model checkpointing and saving utilities.
+
+Usage:
+    python train.py --model_name_or_path <model> --data_path <train.json> --eval_data_path <val.json> ...
+
+Author: Adapted from FastChat, Stanford Alpaca, and LLaVA.
+License: Apache 2.0
+"""
+
+# Copyright and license information
 # Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
 # Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
 #    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
@@ -14,83 +38,93 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import os
-import copy
-from dataclasses import dataclass, field
-import json
-import logging
-import pathlib
-from typing import Dict, Optional, Sequence, List
+# Standard library imports
+import os  # File and directory operations
+import copy  # Deep copying objects
+from dataclasses import dataclass, field  # Argument classes
+import json  # Reading JSON data files
+import logging  # Logging warnings and info
+import pathlib  # File path manipulations
+from typing import Dict, Optional, Sequence, List  # Type hints
 
-import torch
+# Third-party imports
+import torch  # PyTorch for tensor/model operations
+import transformers  # HuggingFace Transformers library
+import tokenizers  # HuggingFace Tokenizers library
 
-import transformers
-import tokenizers
+# Project-specific imports
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN  # Token constants
+from torch.utils.data import Dataset  # PyTorch Dataset class
+from llava.train.llava_trainer import LLaVATrainer  # Custom trainer
+from llava import conversation as conversation_lib  # Conversation templates/utilities
+from llava.model import *  # Model definitions
+from llava.mm_utils import tokenizer_image_token  # Utility for image tokenization
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
+from PIL import Image  # Image processing
+import wandb  # Weights & Biases for experiment tracking
 
-from llava import conversation as conversation_lib
-from llava.model import *
-from llava.mm_utils import tokenizer_image_token
-
-from PIL import Image
-import os 
-
-
-import wandb
+# Login and initialize Weights & Biases for experiment tracking
 wandb.login(key='c0bf463d253eb9147fbe555216398f2838fe517c')
 wandb.init(
-    project="VLM",
-    name="CTViT_LLaVAMed_lora_perceiver",   
-    entity="dacthai2807"
+    project="VLM",  # Project name
+    name="CTViT_LLaVAMed_lora_perceiver",   # Run name
+    entity="dacthai2807"  # W&B entity/user
 )
 
-local_rank = None
-
+local_rank = None  # Used for distributed training to identify process rank
 
 def rank0_print(*args):
+    """
+    Print only if running on local_rank 0 (main process).
+    Used to avoid duplicate logs in distributed training.
+    """
     if local_rank == 0:
         print(*args)
 
-
-from packaging import version
+from packaging import version  # For version comparison
+# Check if the tokenizers library version is >= 0.14
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
-
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    version: Optional[str] = field(default="v0")
-    freeze_backbone: bool = field(default=False)
-    tune_mm_mlp_adapter: bool = field(default=False)
-    vision_tower: Optional[str] = field(default=None)
-    mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
-    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
-    mm_projector_type: Optional[str] = field(default='linear')
-    mm_use_im_start_end: bool = field(default=False)
-    mm_use_im_patch_token: bool = field(default=True)
-    mm_patch_merge_type: Optional[str] = field(default='flat')
-    mm_vision_select_feature: Optional[str] = field(default="patch")
-    pretrained_lora_path: Optional[str] = field(default=None)
-
+    """
+    Arguments for model configuration and loading.
+    """
+    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")  # Model checkpoint
+    version: Optional[str] = field(default="v0")  # Conversation template version
+    freeze_backbone: bool = field(default=False)  # Whether to freeze backbone weights
+    tune_mm_mlp_adapter: bool = field(default=False)  # Whether to train only the multimodal adapter
+    vision_tower: Optional[str] = field(default=None)  # Vision model checkpoint
+    mm_vision_select_layer: Optional[int] = field(default=-1)   # Vision layer to use
+    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)  # Pretrained adapter path
+    mm_projector_type: Optional[str] = field(default='linear')  # Projector type
+    mm_use_im_start_end: bool = field(default=False)  # Use image start/end tokens
+    mm_use_im_patch_token: bool = field(default=True)  # Use image patch tokens
+    mm_patch_merge_type: Optional[str] = field(default='flat')  # Patch merge type
+    mm_vision_select_feature: Optional[str] = field(default="patch")  # Vision feature type
+    pretrained_lora_path: Optional[str] = field(default=None)  # Pretrained LoRA adapter path
 
 @dataclass
 class DataArguments:
-    type: str = 'PET/CT'
+    """
+    Arguments for data loading and preprocessing.
+    """
+    type: str = 'PET/CT'  # Data type (e.g., PET/CT, CT, etc.)
     data_path: str = field(default=None,
-                           metadata={"help": "Path to the training data."})
+                           metadata={"help": "Path to the training data."})  # Path to training data
     eval_data_path: str = field(default=None,
-                           metadata={"help": "Path to the validation data."})
-    lazy_preprocess: bool = False
-    is_multimodal: bool = False
-    image_folder: Optional[str] = field(default=None)
-    image_aspect_ratio: str = 'square'
-
+                           metadata={"help": "Path to the validation data."})  # Path to validation data
+    lazy_preprocess: bool = False  # Whether to use lazy preprocessing
+    is_multimodal: bool = False  # Whether data is multimodal (image+text)
+    image_folder: Optional[str] = field(default=None)  # Folder containing images
+    image_aspect_ratio: str = 'square'  # Aspect ratio for images
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
+    """
+    Arguments for training configuration.
+    Extends HuggingFace TrainingArguments.
+    """
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
@@ -124,8 +158,11 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
 
-
 def maybe_zero_3(param, ignore_status=False, name=None):
+    """
+    Utility for extracting parameter tensors from DeepSpeed Zero-3 partitions.
+    Ensures parameters are gathered and moved to CPU for saving.
+    """
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
     if hasattr(param, "ds_id"):
@@ -138,9 +175,11 @@ def maybe_zero_3(param, ignore_status=False, name=None):
         param = param.detach().cpu().clone()
     return param
 
-
-# Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
+    """
+    Extracts LoRA adapter parameters for saving, handling DeepSpeed Zero-3.
+    Supports different bias saving modes.
+    """
     if bias == "none":
         to_return = {k: t for k, t in named_params if "lora_" in k}
     elif bias == "all":
@@ -164,22 +203,29 @@ def get_peft_state_maybe_zero_3(named_params, bias):
     to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
     return to_return
 
-
 def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
+    """
+    Extracts non-LoRA parameters for saving, optionally filtering by requires_grad.
+    """
     to_return = {k: t for k, t in named_params if "lora_" not in k}
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
 
-
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
+    """
+    Extracts multimodal adapter parameters for saving, matching specific keys.
+    """
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
 
-
 def find_all_linear_names(model):
+    """
+    Finds all linear module names in the model, excluding multimodal and output layers.
+    Used for targeting LoRA adapters.
+    """
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
@@ -189,25 +235,21 @@ def find_all_linear_names(model):
         if isinstance(module, cls):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
     if 'lm_head' in lora_module_names: # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
-
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
-                                   output_dir: str):
-    """Collects the state dict and dump to disk."""
-
+def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+    """
+    Saves model checkpoints safely, handling DeepSpeed and adapter-only saving.
+    """
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
-
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
-
         current_folder = output_dir.split('/')[-1]
         parent_folder = os.path.dirname(output_dir)
         if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
@@ -218,12 +260,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         return
-
     if trainer.deepspeed:
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
         return
-
     state_dict = trainer.model.state_dict()
     if trainer.args.should_save:
         cpu_state_dict = {
@@ -233,35 +273,29 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
-
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
     tokenizer: transformers.PreTrainedTokenizer,
     model: transformers.PreTrainedModel,
 ):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+    Adds special tokens to the tokenizer and resizes model embeddings.
+    Newly added tokens are initialized with the mean of existing embeddings.
     """
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
-
     if num_new_tokens > 0:
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
-            dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
-            dim=0, keepdim=True)
-
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-
-def _tokenize_fn(strings: Sequence[str],
-                 tokenizer: transformers.PreTrainedTokenizer) -> Dict:
-    """Tokenize a list of strings."""
+def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    """
+    Tokenizes a list of strings, returning input IDs, labels, and their lengths.
+    """
     tokenized_list = [
         tokenizer(
             text,
@@ -285,9 +319,11 @@ def _tokenize_fn(strings: Sequence[str],
         labels_lens=labels_lens,
     )
 
-
 def _mask_targets(target, tokenized_lens, speakers):
-    # cur_idx = 0
+    """
+    Masks target tokens for supervised fine-tuning.
+    Human tokens are masked with IGNORE_INDEX so only model outputs are trained.
+    """
     cur_idx = tokenized_lens[0]
     tokenized_lens = tokenized_lens[1:]
     target[:cur_idx] = IGNORE_INDEX
@@ -296,9 +332,11 @@ def _mask_targets(target, tokenized_lens, speakers):
             target[cur_idx+2:cur_idx + tokenized_len] = IGNORE_INDEX
         cur_idx += tokenized_len
 
-
 def _add_speaker_and_signal(header, source, get_conversation=True):
-    """Add speaker and start/end signal on each round."""
+    """
+    Adds speaker and start/end signal to each round in a conversation.
+    Used for prompt formatting.
+    """
     BEGIN_SIGNAL = "### "
     END_SIGNAL = "\n"
     conversation = header
@@ -317,15 +355,17 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
     conversation += BEGIN_SIGNAL
     return conversation
 
-
 def preprocess_multimodal(
     sources: Sequence[str],
     data_args: DataArguments
 ) -> Dict:
+    """
+    Preprocesses multimodal sources by handling image tokens and formatting.
+    Adds image start/end tokens if required.
+    """
     is_multimodal = data_args.is_multimodal
     if not is_multimodal:
         return sources
-
     for source in sources:
         for sentence in source:
             if DEFAULT_IMAGE_TOKEN in sentence['value']:
@@ -338,15 +378,17 @@ def preprocess_multimodal(
             if data_args.mm_use_im_start_end:
                 replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
             sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
-
     return sources
-
 
 def preprocess_llama_2(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
+    """
+    Preprocesses conversations for LLaMA-2 style prompts.
+    Handles masking and tokenization for multimodal and text-only data.
+    """
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -423,12 +465,15 @@ def preprocess_llama_2(
         labels=targets,
     )
 
-
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
+    """
+    Preprocesses conversations for Vicuna v1 style prompts.
+    Handles masking and tokenization for multimodal and text-only data.
+    """
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -509,34 +554,42 @@ def preprocess_v1(
         labels=targets,
     )
 
-
 def preprocess_mpt(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
+    """
+    Preprocesses conversations for MPT style prompts.
+    Handles masking and tokenization for multimodal and text-only data.
+    """
+    # Create a copy of the default conversation template
     conv = conversation_lib.default_conversation.copy()
+    # Map roles to conversation template roles
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
-    # Apply prompt templates
+    # Apply prompt templates to each source conversation
     conversations = []
     for i, source in enumerate(sources):
+        # If the first message is not from human, skip it
         if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
+            # Ensure the role alternates correctly (human/gpt/human/gpt...)
             assert role == conv.roles[j % 2], f"{i}"
             conv.append_message(role, sentence["value"])
+        # Get the full prompt for this conversation
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
     if has_image:
+        # If images are present, use special tokenization that includes image tokens
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
+        # Otherwise, use standard tokenizer
         input_ids = tokenizer(
             conversations,
             return_tensors="pt",
@@ -545,18 +598,23 @@ def preprocess_mpt(
             truncation=True,
         ).input_ids
 
+    # Targets are initially a copy of input_ids
     targets = input_ids.clone()
+
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
-    # Mask targets
+    # Mask targets so only model outputs are trained (not human input)
     sep = conv.sep + conv.roles[1]
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
+        # Split conversation into rounds using the separator
         rounds = conversation.split(conv.sep)
+        # Reformat rounds: first round is system+user+gpt, then user+gpt pairs
         re_rounds = [conv.sep.join(rounds[:3])] # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
             re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx+2]))    # user + gpt
+
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -568,6 +626,7 @@ def preprocess_mpt(
                 break
             parts[0] += sep
 
+            # Calculate token lengths for masking
             if has_image:
                 round_len = len(tokenizer_image_token(rou, tokenizer))
                 instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
@@ -575,15 +634,19 @@ def preprocess_mpt(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
 
+            # Adjust lengths for legacy tokenizers
             if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len += 1
                 instruction_len += 1
 
+            # Mask human tokens with IGNORE_INDEX
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
+        # Mask any remaining tokens
         target[cur_len:] = IGNORE_INDEX
 
+        # If tokenization mismatch, mask all tokens and print warning
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
                 target[:] = IGNORE_INDEX
@@ -592,16 +655,20 @@ def preprocess_mpt(
                     f" (ignored)"
                 )
 
+    # Return tokenized input and masked targets
     return dict(
         input_ids=input_ids,
         labels=targets,
     )
 
-
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
+    """
+    Preprocesses plain conversations (no special formatting).
+    Used for models with plain separator style.
+    """
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -619,18 +686,15 @@ def preprocess_plain(
 
     return dict(input_ids=input_ids, labels=targets)
 
-
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
     """
-    Given a list of sources, each is a conversation list. This transform:
-    1. Add signal '### ' at the beginning each sentence, with end signal '\n';
-    2. Concatenate conversations together;
-    3. Tokenize the concatenated conversation;
-    4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
+    Main preprocessing entry point.
+    Selects the correct preprocessing function based on conversation style.
+    Handles speaker signals, concatenation, tokenization, and masking.
     """
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
@@ -667,12 +731,16 @@ def preprocess(
 
     return dict(input_ids=input_ids, labels=targets)
 
-
 from image_process import load_with_augment, process_image, add_gaussian_noise
 import numpy as np
-class LazySupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
 
+class LazySupervisedDataset(Dataset):
+    """
+    Dataset for supervised fine-tuning.
+    Loads data from a JSON file, applies augmentation and preprocessing,
+    and returns tokenized samples for training.
+    Supports multimodal (image+text) and text-only data.
+    """
     def __init__(self, type: str, data_path: str, augment: callable, 
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
@@ -697,6 +765,7 @@ class LazySupervisedDataset(Dataset):
 
     @property
     def lengths(self):
+        # Compute token lengths for each sample (including image tokens if present)
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if 'image' in sample else 0
@@ -705,6 +774,7 @@ class LazySupervisedDataset(Dataset):
 
     @property
     def modality_lengths(self):
+        # Compute modality-specific lengths (positive for multimodal, negative for text-only)
         length_list = []
         for sample in self.list_data_dict:
             cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
@@ -713,12 +783,13 @@ class LazySupervisedDataset(Dataset):
         return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        
+        # Get a single sample, process images if present, and tokenize conversation
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
+            # PET/CT multimodal image handling
             if self.type == 'PET/CT':
                 pet_image_file = self.list_data_dict[i]['image']
                 ct_image_file = pet_image_file.replace('images', 'ref_images')
@@ -734,6 +805,7 @@ class LazySupervisedDataset(Dataset):
                 pet_image = process_image(pet_image)
                 ct_image = process_image(ct_image, is_pet=False)
             else:
+                # Single modality image handling
                 image_file = self.list_data_dict[i]['image']
                 image_folder = self.data_args.image_folder
 
@@ -745,11 +817,14 @@ class LazySupervisedDataset(Dataset):
                 is_pet = False if self.type == 'CT' else True
                 image = process_image(image, is_pet=is_pet)
   
+            # Preprocess conversation for multimodal input
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
         else:
+            # Text-only conversation
             sources = copy.deepcopy([e["conversations"] for e in sources])
+        # Tokenize and mask conversation
         data_dict = preprocess(
             sources,
             self.tokenizer,
@@ -758,7 +833,7 @@ class LazySupervisedDataset(Dataset):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
-        # image exist in the data
+        # Attach processed images to output dict
         if 'image' in self.list_data_dict[i]:
             if self.type == 'PET/CT':
                 data_dict['pet_image'] = pet_image
@@ -766,21 +841,22 @@ class LazySupervisedDataset(Dataset):
             else:
                 data_dict['image'] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
+            # If model expects image but sample doesn't have one, fill with zeros
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
         return data_dict
 
-
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
+    """Collate examples for supervised fine-tuning. Pads sequences and stacks images."""
 
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        # Extract input_ids and labels from instances
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+        # Pad input_ids and labels to same length
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -788,6 +864,7 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(labels,
                                                  batch_first=True,
                                                  padding_value=IGNORE_INDEX)
+        # Truncate to model_max_length
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
         batch = dict(
@@ -796,6 +873,7 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
+        # Stack images if present (PET/CT or single modality)
         if 'pet_image' in instances[0] and 'ct_image' in instances[0]:
             pet_images = [instance['pet_image'] for instance in instances]
             ct_images = [instance['ct_image'] for instance in instances]
@@ -812,31 +890,39 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = { 'data': images }
         return batch
 
-
 def make_supervised_data_module(type: str, tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    # Create train and validation datasets
     train_dataset = LazySupervisedDataset(type=type, tokenizer=tokenizer, augment=None,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
     val_dataset = LazySupervisedDataset(type=type, tokenizer=tokenizer, augment=None,
                                 data_path=data_args.eval_data_path,
                                 data_args=data_args)
+    # Create data collator for batching
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
                 eval_dataset=val_dataset,
                 data_collator=data_collator)
 
-
 def train(attn_implementation=None):
+    """
+    Main training loop.
+    Loads model/tokenizer, prepares data, configures adapters/quantization,
+    and runs training with checkpointing and logging.
+    """
     global local_rank
 
+    # Parse command-line arguments for model, data, and training
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
+    # Set compute dtype based on fp16/bf16 flags
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    # --- BitsAndBytes quantization setup ---
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -856,6 +942,8 @@ def train(attn_implementation=None):
             )
         ))
 
+    # --- Model loading ---
+    # Load model based on vision tower and architecture
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
@@ -884,14 +972,17 @@ def train(attn_implementation=None):
         )
     model.config.use_cache = False
 
+    # Optionally freeze backbone weights
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
+    # --- LoRA and quantization setup ---
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
         model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
+    # Enable gradient checkpointing if requested
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -900,8 +991,8 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+    # --- LoRA adapter loading or creation ---
     pretrained_lora_path = getattr(model_args, "pretrained_lora_path", None)
-    
     if pretrained_lora_path is not None and training_args.lora_enable:
         rank0_print(f"Loading LoRA weights from {pretrained_lora_path}")
         from peft import PeftModel 
@@ -910,7 +1001,6 @@ def train(attn_implementation=None):
             pretrained_lora_path, 
             is_trainable=True
         )
-
     elif training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -929,6 +1019,7 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
+    # --- Tokenizer loading and setup ---
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -945,6 +1036,7 @@ def train(attn_implementation=None):
             use_fast=False,
         )
 
+    # --- Tokenizer special token setup ---
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
             smart_tokenizer_and_embedding_resize(
@@ -961,6 +1053,7 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+    # --- Vision module initialization ---
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -1001,6 +1094,7 @@ def train(attn_implementation=None):
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
+    # --- BitsAndBytes dtype fix for LoRA layers and normalization ---
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
@@ -1016,13 +1110,17 @@ def train(attn_implementation=None):
 
     print("training_args: ", training_args)
     
+    # --- Data module creation ---
     data_module = make_supervised_data_module(data_args.type, tokenizer=tokenizer,
                                               data_args=data_args)
+    # --- Trainer creation ---
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
 
+    # --- Training loop ---
+    # Resume from checkpoint if available, otherwise start fresh
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
@@ -1031,7 +1129,9 @@ def train(attn_implementation=None):
 
     model.config.use_cache = True
 
+    # --- Model saving ---
     if training_args.lora_enable:
+        # Save LoRA and non-LoRA weights separately
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
         )
@@ -1043,10 +1143,10 @@ def train(attn_implementation=None):
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
     else:
+        # Save full model
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
 
-
 if __name__ == "__main__":
-    
+    # Entry point for script execution
     train()
